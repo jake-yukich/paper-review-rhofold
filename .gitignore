@@ -1,6 +1,5 @@
-CLAUDE.md
-.claude/
-data/ribonanza/
-data/stanford-rna-3d-folding/
+data/
+main/TODO.md
 rhofold-main/pretrained/rhofold_pretrained_params.pt
+rhofold-main/rhofold/data/
 .venv/
