@@ -1,5 +1,7 @@
 data/
 main/TODO.md
+main/__pycache__/
 rhofold-main/pretrained/rhofold_pretrained_params.pt
 rhofold-main/rhofold/data/
 .venv/
+**/__pycache__/
