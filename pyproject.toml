@@ -6,11 +6,14 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "biopython>=1.85",
+    "einops>=0.8.1",
+    "fancy-einsum>=0.0.3",
     "ipykernel>=6.29.5",
     "kaggle>=1.7.4.5",
     "matplotlib>=3.10.3",
     "ml-collections>=1.1.0",
     "numpy>=2.2.6",
+    "pandas>=2.3.0",
     "polars>=1.30.0",
     "seaborn>=0.13.2",
     "torch>=2.7.0",

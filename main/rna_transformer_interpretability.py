@@ -72,12 +72,12 @@ class RNATransformerConfig:
     use_attn_bias: bool = True
     use_mlp_bias: bool = True
     
-    # RNA-specific tokens
-    pad_token_id: int = 0
-    cls_token_id: int = 1
+    # RNA-specific tokens (matching RhoFold alphabet)
+    cls_token_id: int = 0
+    pad_token_id: int = 1
     eos_token_id: int = 2
     unk_token_id: int = 3
-    mask_token_id: int = 4
+    mask_token_id: int = 24
     
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0
@@ -88,20 +88,21 @@ class RNATokenizer:
     """Simple RNA tokenizer compatible with RhoFold's alphabet"""
     
     def __init__(self):
-        # RNA nucleotides and ambiguity codes
+        # Match RhoFold's exact token order:
+        # ['<cls>', '<pad>', '<eos>', '<unk>', 'A', 'C', 'G', 'U', 'R', 'Y', 'K', 'M', 'S', 'W', 'B', 'D', 'H', 'V', 'N', '-', '<null_1>', '<null_2>', '<null_3>', '<null_4>', '<mask>']
         self.base_tokens = ['A', 'C', 'G', 'U', 'R', 'Y', 'K', 'M', 
                            'S', 'W', 'B', 'D', 'H', 'V', 'N', '-']
-        self.special_tokens = ['<pad>', '<cls>', '<eos>', '<unk>', '<mask>']
         
-        self.vocab = self.special_tokens + self.base_tokens
+        # Build vocab exactly like RhoFold
+        self.vocab = ['<cls>', '<pad>', '<eos>', '<unk>'] + self.base_tokens + ['<null_1>', '<null_2>', '<null_3>', '<null_4>', '<mask>']
         self.token_to_id = {token: idx for idx, token in enumerate(self.vocab)}
         self.id_to_token = {idx: token for token, idx in self.token_to_id.items()}
         
-        self.pad_token_id = 0
-        self.cls_token_id = 1
+        self.cls_token_id = 0
+        self.pad_token_id = 1
         self.eos_token_id = 2
         self.unk_token_id = 3
-        self.mask_token_id = 4
+        self.mask_token_id = 24
     
     def encode(self, sequence: str, add_special_tokens: bool = True) -> List[int]:
         """Encode RNA sequence to token IDs"""
@@ -122,11 +123,12 @@ class RNATokenizer:
     
     def decode(self, token_ids: List[int], skip_special_tokens: bool = True) -> str:
         """Decode token IDs back to RNA sequence"""
+        special_tokens = ['<cls>', '<pad>', '<eos>', '<unk>', '<mask>', '<null_1>', '<null_2>', '<null_3>', '<null_4>']
         tokens = []
         for tid in token_ids:
             if tid in self.id_to_token:
                 token = self.id_to_token[tid]
-                if skip_special_tokens and token in self.special_tokens:
+                if skip_special_tokens and token in special_tokens:
                     continue
                 tokens.append(token)
         return ''.join(tokens)
@@ -154,15 +156,15 @@ class HookedTransformerBlock(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None,
                 cache_activations: bool = False) -> torch.Tensor:
         """
-        Forward pass through transformer block
+        Forward pass through transformer block - RhoFold compatible (T,B,E) format
         
         Args:
-            x: Input tensor [batch, seq_len, d_model]
-            attention_mask: Optional attention mask [batch, seq_len, seq_len]
+            x: Input tensor [seq_len, batch, d_model]
+            attention_mask: Optional padding mask [batch, seq_len] where True = padding
             cache_activations: Whether to cache intermediate activations
         
         Returns:
-            Output tensor [batch, seq_len, d_model]
+            Output tensor [seq_len, batch, d_model]
         """
         residual = x
         x_normed = self.ln1(x)
@@ -214,25 +216,26 @@ class HookedMultiHeadAttention(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None,
                 cache_activations: bool = False) -> torch.Tensor:
         """
-        Multi-head attention forward pass
+        Multi-head attention forward pass - RhoFold compatible (T,B,E) format
         
         Args:
-            x: Input tensor [batch, seq_len, d_model]
-            attention_mask: Optional mask [batch, seq_len, seq_len]
+            x: Input tensor [seq_len, batch, d_model]
+            attention_mask: Optional padding mask [batch, seq_len] where True = padding
             cache_activations: Whether to cache intermediate values
         
         Returns:
-            Attention output [batch, seq_len, d_model]
+            Attention output [seq_len, batch, d_model]
         """
-        batch_size, seq_len, _ = x.shape
+        seq_len, batch_size, _ = x.shape
         
         Q = self.W_Q(x)
         K = self.W_K(x)
         V = self.W_V(x)
         
-        Q = einops.rearrange(Q, 'b s (h d) -> b h s d', h=self.cfg.n_heads)
-        K = einops.rearrange(K, 'b s (h d) -> b h s d', h=self.cfg.n_heads)
-        V = einops.rearrange(V, 'b s (h d) -> b h s d', h=self.cfg.n_heads)
+        # Rearrange for (T,B,E) input format
+        Q = einops.rearrange(Q, 's b (h d) -> b h s d', h=self.cfg.n_heads)
+        K = einops.rearrange(K, 's b (h d) -> b h s d', h=self.cfg.n_heads)
+        V = einops.rearrange(V, 's b (h d) -> b h s d', h=self.cfg.n_heads)
         
         if cache_activations:
             self.hooks[f"layer{self.layer_idx}.Q"].append(Q.detach())
@@ -242,9 +245,11 @@ class HookedMultiHeadAttention(nn.Module):
         scores = einsum('b h q d, b h k d -> b h q k', Q, K) * self.scale
         
         if attention_mask is not None:
-            # Expand mask for heads dimension
-            mask = attention_mask[:, None, :, :]
-            scores = scores.masked_fill(mask == 0, -1e9)
+            # attention_mask: [batch, seq_len] where True = padding
+            # Convert to attention scores mask: [batch, 1, seq_len, seq_len]
+            mask = attention_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, S]
+            mask = mask.expand(-1, -1, seq_len, -1)  # [B, 1, S, S] 
+            scores = scores.masked_fill(mask, -1e9)
         
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
@@ -253,7 +258,7 @@ class HookedMultiHeadAttention(nn.Module):
             self.hooks[f"layer{self.layer_idx}.attn_weights"].append(attn_weights.detach())
         
         attn_out = einsum('b h q k, b h k d -> b h q d', attn_weights, V)
-        attn_out = einops.rearrange(attn_out, 'b h s d -> b s (h d)')
+        attn_out = einops.rearrange(attn_out, 'b h s d -> s b (h d)')  # Back to (T,B,E)
         output = self.W_O(attn_out)
         
         if cache_activations:
@@ -280,14 +285,14 @@ class HookedMLP(nn.Module):
     
     def forward(self, x: torch.Tensor, cache_activations: bool = False) -> torch.Tensor:
         """
-        MLP forward pass
+        MLP forward pass - works with both (B,T,E) and (T,B,E) formats
         
         Args:
-            x: Input tensor [batch, seq_len, d_model]
+            x: Input tensor [seq_len, batch, d_model] - RhoFold format
             cache_activations: Whether to cache intermediate activations
         
         Returns:
-            MLP output [batch, seq_len, d_model]
+            MLP output [seq_len, batch, d_model]
         """
         hidden = self.W_in(x)
         
@@ -320,6 +325,9 @@ class RNATransformerWithHooks(nn.Module):
         self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.pos_embedding = nn.Embedding(cfg.n_ctx, cfg.d_model)
         self.dropout = nn.Dropout(cfg.dropout)
+        
+        # Add pre-transformer embedding layer norm to match RhoFold architecture
+        self.emb_layer_norm_before = nn.LayerNorm(cfg.d_model, eps=1e-5)
         
         self.blocks = nn.ModuleList([
             HookedTransformerBlock(cfg, idx) for idx in range(cfg.n_layers)
@@ -367,35 +375,75 @@ class RNATransformerWithHooks(nn.Module):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        # Create padding-aware position embeddings like RhoFold
+        if attention_mask is not None:
+            # attention_mask: 1 for real tokens, 0 for padding
+            mask = attention_mask.int()
+            # Compute cumulative positions for non-padding tokens only
+            positions = (torch.cumsum(mask, dim=1).type_as(mask) * mask).long()
+            # Add padding offset (RhoFold uses padding_idx + positions)
+            positions = positions + self.cfg.pad_token_id  # pad_token_id = 1
+            # Clamp to valid range
+            positions = positions.clamp(max=self.cfg.n_ctx - 1)
+        else:
+            # No mask provided, use sequential positions
+            positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         
         token_embeds = self.token_embedding(input_ids)
-        pos_embeds = self.pos_embedding(position_ids)
+        pos_embeds = self.pos_embedding(positions)
         
         x = token_embeds + pos_embeds
+        # Apply pre-transformer layer norm like RhoFold
+        x = self.emb_layer_norm_before(x)
+        
+        # Apply padding mask like RhoFold (if attention_mask provided)
+        if attention_mask is not None:
+            # Convert attention_mask (1 for real tokens, 0 for padding) to padding_mask format
+            padding_mask = (attention_mask == 0)  # True for padding tokens
+            # Apply mask by zeroing out padding positions
+            x = x * (1 - padding_mask.unsqueeze(-1).float())
+        
         x = self.dropout(x)
         
         if cache_activations:
             self.hooks["embeddings"].append(x.detach())
         
-        if attention_mask is not None:
-            extended_attention_mask = attention_mask[:, None, None, :].float()
-            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-        else:
-            extended_attention_mask = None
+        # Convert to (T,B,E) format for transformer blocks like RhoFold
+        x = x.transpose(0, 1)  # (B,T,E) -> (T,B,E)
         
+        # Convert attention mask for RhoFold-style processing
+        if attention_mask is not None:
+            # Use the padding mask we computed above
+            rhofold_padding_mask = padding_mask
+        else:
+            rhofold_padding_mask = None
+        
+        # Track hidden states
         hidden_states = []
         if return_hidden_states:
-            hidden_states.append(x)
+            # Store as (B,T,E) for output compatibility
+            hidden_states.append(x.transpose(0, 1))
         
-        for block in self.blocks:
-            x = block(x, attention_mask=extended_attention_mask, 
+        # Pass through transformer blocks in (T,B,E) format
+        for i, block in enumerate(self.blocks):
+            x = block(x, attention_mask=rhofold_padding_mask, 
                      cache_activations=cache_activations)
             
             if return_hidden_states:
-                hidden_states.append(x)
+                if i == len(self.blocks) - 1:  # Last layer (layer 11, which becomes layer 12 in 1-indexed)
+                    # First storage: before final layer norm (will be overwritten)
+                    hidden_states.append(x.transpose(0, 1))  # Store as (B,T,E)
+                else:
+                    hidden_states.append(x.transpose(0, 1))  # Store as (B,T,E)
         
-        x = self.ln_f(x)
+        # Apply final layer norm in (T,B,E) format like RhoFold
+        x = self.ln_f(x)  # Apply layer norm in (T,B,E) format
+        
+        # Update the final hidden state to include layer norm (like RhoFold's overwrite)
+        if return_hidden_states:
+            hidden_states[-1] = x.transpose(0, 1)  # Overwrite with post-layer-norm version
+        
+        x = x.transpose(0, 1)  # (T,B,E) -> (B,T,E)
         
         if cache_activations:
             self.hooks["ln_final"].append(x.detach())
